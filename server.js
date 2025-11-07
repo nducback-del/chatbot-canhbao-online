@@ -1,107 +1,120 @@
-// server.js
 const express = require('express');
-const fs = require('fs');
-const cors = require('cors');
 const bodyParser = require('body-parser');
-const crypto = require('crypto');
-
+const cors = require('cors');
+const sqlite3 = require('sqlite3').verbose();
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(bodyParser.json());
 
-const KEY_FILE = './keys.json';
+// SQLite database
+const db = new sqlite3.Database('./licenses.db');
+db.run(`
+CREATE TABLE IF NOT EXISTS license_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  key_code TEXT,
+  created_at TEXT,
+  expires_at TEXT,
+  is_active INTEGER,
+  allowed_devices INTEGER DEFAULT 1,
+  used_devices TEXT DEFAULT '[]'
+)
+`);
 
-// Load keys từ file JSON
-function loadKeys() {
-  if (!fs.existsSync(KEY_FILE)) fs.writeFileSync(KEY_FILE, JSON.stringify([]));
-  return JSON.parse(fs.readFileSync(KEY_FILE));
-}
-
-// Lưu keys
-function saveKeys(keys) {
-  fs.writeFileSync(KEY_FILE, JSON.stringify(keys, null, 2));
-}
-
-// Tạo key ngẫu nhiên
+// Helper: Tạo key ngẫu nhiên
 function generateKey() {
-  return 'ZXS-' + crypto.randomBytes(4).toString('hex').toUpperCase();
+  const prefix = "ZXS";
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  const parts = Array.from({ length: 3 }, () =>
+    Array.from({ length: 4 }, () => chars[Math.floor(Math.random() * chars.length)]).join("")
+  );
+  return `${prefix}-${parts.join('-')}`;
 }
 
-// Tính thời hạn
-function getExpiry(duration) {
-  const now = new Date();
-  switch(duration) {
-    case 'day': now.setDate(now.getDate()+1); break;
-    case 'week': now.setDate(now.getDate()+7); break;
-    case 'month': now.setMonth(now.getMonth()+1); break;
-    case 'year': now.setFullYear(now.getFullYear()+1); break;
-    default: now.setDate(now.getDate()+1);
-  }
-  return Math.floor(now.getTime()/1000);
-}
+// ✅ Check key (dành cho Windows Form)
+app.post('/api/check-key', (req, res) => {
+  const { key, machineId } = req.body;
+  db.get(`SELECT * FROM license_keys WHERE key_code = ?`, [key], (err, row) => {
+    if (err) return res.status(500).send(err.message);
+    if (!row) return res.json({ valid: false, reason: 'Key không tồn tại' });
 
-// --- API --- //
-// Lấy danh sách key
-app.get('/api/keys', (req, res) => {
-  const keys = loadKeys();
-  res.json({ ok: true, keys });
+    const now = new Date();
+    if (!row.is_active) return res.json({ valid: false, reason: 'Key bị vô hiệu hóa' });
+    if (new Date(row.expires_at) < now) return res.json({ valid: false, reason: 'Key hết hạn' });
+
+    let used = JSON.parse(row.used_devices || "[]");
+    if (!used.includes(machineId)) {
+      if (used.length >= row.allowed_devices)
+        return res.json({ valid: false, reason: 'Vượt giới hạn số máy đăng nhập' });
+      used.push(machineId);
+      db.run(`UPDATE license_keys SET used_devices=? WHERE key_code=?`, [JSON.stringify(used), key]);
+    }
+
+    res.json({ valid: true, expires_at: row.expires_at });
+  });
 });
 
-// Tạo key mới
+// 🆕 Tạo key mới
 app.post('/api/create-key', (req, res) => {
-  const { duration, device_limit } = req.body;
-  if (!duration || !device_limit) return res.json({ ok:false, message:"Thiếu dữ liệu" });
-
-  const keys = loadKeys();
-  const key = {
-    key_text: generateKey(),
-    created_at: Math.floor(Date.now()/1000),
-    expires_at: getExpiry(duration),
-    device_limit: parseInt(device_limit),
-    devices_used: 0
-  };
-  keys.push(key);
-  saveKeys(keys);
-  res.json({ ok:true, key: key.key_text });
+  const { days, devices } = req.body;
+  const key = generateKey();
+  const now = new Date();
+  const expires = new Date(now.getTime() + days * 86400000);
+  db.run(`INSERT INTO license_keys (key_code, created_at, expires_at, is_active, allowed_devices)
+          VALUES (?, ?, ?, 1, ?)`,
+    [key, now.toISOString(), expires.toISOString(), devices || 1],
+    err => {
+      if (err) return res.status(500).send(err.message);
+      res.json({ key, expires: expires.toISOString() });
+    });
 });
 
-// Reset/Gia hạn key (+1 ngày)
-app.put('/api/reset-key/:key', (req, res) => {
-  const { key } = req.params;
-  const keys = loadKeys();
-  const k = keys.find(x => x.key_text === key);
-  if (!k) return res.json({ ok:false, message:"Không tìm thấy key" });
-  k.expires_at += 86400; // +1 ngày
-  saveKeys(keys);
-  res.json({ ok:true, message:"Đã thêm 1 ngày cho key "+key });
+// 📋 Danh sách key
+app.get('/api/list-keys', (req, res) => {
+  db.all(`SELECT * FROM license_keys`, (err, rows) => {
+    if (err) return res.status(500).send(err.message);
+    res.json(rows);
+  });
 });
 
-// Xoá key
-app.delete('/api/delete-key/:key', (req, res) => {
-  const { key } = req.params;
-  let keys = loadKeys();
-  keys = keys.filter(x => x.key_text !== key);
-  saveKeys(keys);
-  res.json({ ok:true, message:"Đã xoá key "+key });
+// 🔁 Reset key (xoá danh sách thiết bị)
+app.post('/api/reset-key', (req, res) => {
+  const { key } = req.body;
+  db.run(`UPDATE license_keys SET used_devices='[]' WHERE key_code=?`, [key], err => {
+    if (err) return res.status(500).send(err.message);
+    res.json({ message: "Đã reset key" });
+  });
 });
 
-// Check key login
-app.get('/api/check-key/:key', (req, res) => {
-  const { key } = req.params;
-  const keys = loadKeys();
-  const k = keys.find(x => x.key_text === key);
-  if (!k) return res.json({ ok: false, message: "Key không tồn tại" });
-
-  const now = Math.floor(Date.now()/1000);
-  if (k.expires_at < now)
-    return res.json({ ok: false, message: "Key đã hết hạn" });
-
-  if (k.devices_used >= k.device_limit)
-    return res.json({ ok: false, message: "Đã đạt giới hạn thiết bị" });
-
-  res.json({ ok: true, message: "Key hợp lệ" });
+// ⏫ Gia hạn key
+app.post('/api/extend-key', (req, res) => {
+  const { key, days } = req.body;
+  db.get(`SELECT * FROM license_keys WHERE key_code = ?`, [key], (err, row) => {
+    if (!row) return res.status(404).send("Key không tồn tại");
+    const newDate = new Date(row.expires_at);
+    newDate.setDate(newDate.getDate() + days);
+    db.run(`UPDATE license_keys SET expires_at = ? WHERE key_code = ?`, [newDate.toISOString(), key]);
+    res.json({ message: "Gia hạn thành công", new_expires: newDate.toISOString() });
+  });
 });
 
-app.listen(PORT, () => console.log(`Server chạy trên http://localhost:${PORT}`));
+// ❌ Xoá key
+app.post('/api/delete-key', (req, res) => {
+  const { key } = req.body;
+  db.run(`DELETE FROM license_keys WHERE key_code = ?`, [key]);
+  res.json({ message: "Đã xoá key" });
+});
+
+// 🚪 Admin login
+app.post('/api/admin-login', (req, res) => {
+  const { username, password } = req.body;
+  if (username === "admin" && password === "123456")
+    return res.json({ success: true });
+  res.status(401).json({ success: false });
+});
+
+// Server khởi chạy
+app.listen(PORT, "0.0.0.0", () =>
+  console.log(`✅ Server chạy tại http://localhost:${PORT}`)
+);
