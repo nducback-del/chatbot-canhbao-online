@@ -1,120 +1,107 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
-const sqlite3 = require('sqlite3').verbose();
+const fs = require('fs');
 const app = express();
-const PORT = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(bodyParser.json());
 
-// SQLite database
-const db = new sqlite3.Database('./licenses.db');
-db.run(`
-CREATE TABLE IF NOT EXISTS license_keys (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  key_code TEXT,
-  created_at TEXT,
-  expires_at TEXT,
-  is_active INTEGER,
-  allowed_devices INTEGER DEFAULT 1,
-  used_devices TEXT DEFAULT '[]'
-)
-`);
+const PORT = process.env.PORT || 3000;
 
-// Helper: Tạo key ngẫu nhiên
+// ======= Load / Lưu file key.json =======
+let keys = [];
+const DATA_FILE = './keys.json';
+
+function loadKeys() {
+  if (fs.existsSync(DATA_FILE)) {
+    keys = JSON.parse(fs.readFileSync(DATA_FILE));
+  }
+}
+function saveKeys() {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(keys, null, 2));
+}
+loadKeys();
+
+// ======= Random key generator =======
 function generateKey() {
-  const prefix = "ZXS";
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-  const parts = Array.from({ length: 3 }, () =>
-    Array.from({ length: 4 }, () => chars[Math.floor(Math.random() * chars.length)]).join("")
-  );
-  return `${prefix}-${parts.join('-')}`;
+  const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  const part = () => Array.from({ length: 4 }, () => letters[Math.floor(Math.random() * letters.length)]).join('');
+  return `ZXS-${part()}-${part()}-${part()}`;
 }
 
-// ✅ Check key (dành cho Windows Form)
-app.post('/api/check-key', (req, res) => {
-  const { key, machineId } = req.body;
-  db.get(`SELECT * FROM license_keys WHERE key_code = ?`, [key], (err, row) => {
-    if (err) return res.status(500).send(err.message);
-    if (!row) return res.json({ valid: false, reason: 'Key không tồn tại' });
-
-    const now = new Date();
-    if (!row.is_active) return res.json({ valid: false, reason: 'Key bị vô hiệu hóa' });
-    if (new Date(row.expires_at) < now) return res.json({ valid: false, reason: 'Key hết hạn' });
-
-    let used = JSON.parse(row.used_devices || "[]");
-    if (!used.includes(machineId)) {
-      if (used.length >= row.allowed_devices)
-        return res.json({ valid: false, reason: 'Vượt giới hạn số máy đăng nhập' });
-      used.push(machineId);
-      db.run(`UPDATE license_keys SET used_devices=? WHERE key_code=?`, [JSON.stringify(used), key]);
-    }
-
-    res.json({ valid: true, expires_at: row.expires_at });
-  });
-});
-
-// 🆕 Tạo key mới
-app.post('/api/create-key', (req, res) => {
-  const { days, devices } = req.body;
-  const key = generateKey();
-  const now = new Date();
-  const expires = new Date(now.getTime() + days * 86400000);
-  db.run(`INSERT INTO license_keys (key_code, created_at, expires_at, is_active, allowed_devices)
-          VALUES (?, ?, ?, 1, ?)`,
-    [key, now.toISOString(), expires.toISOString(), devices || 1],
-    err => {
-      if (err) return res.status(500).send(err.message);
-      res.json({ key, expires: expires.toISOString() });
-    });
-});
-
-// 📋 Danh sách key
+// ======= API: Danh sách key =======
 app.get('/api/list-keys', (req, res) => {
-  db.all(`SELECT * FROM license_keys`, (err, rows) => {
-    if (err) return res.status(500).send(err.message);
-    res.json(rows);
-  });
+  res.json(keys);
 });
 
-// 🔁 Reset key (xoá danh sách thiết bị)
-app.post('/api/reset-key', (req, res) => {
-  const { key } = req.body;
-  db.run(`UPDATE license_keys SET used_devices='[]' WHERE key_code=?`, [key], err => {
-    if (err) return res.status(500).send(err.message);
-    res.json({ message: "Đã reset key" });
-  });
+// ======= API: Tạo key mới =======
+app.post('/api/create-key', (req, res) => {
+  const { days } = req.body;
+  const newKey = generateKey();
+  const created_at = new Date();
+  const expires_at = new Date(created_at.getTime() + days * 24 * 60 * 60 * 1000);
+  const keyObj = {
+    key_code: newKey,
+    created_at,
+    expires_at,
+    allowed_devices: 1,
+    devices: []
+  };
+  keys.push(keyObj);
+  saveKeys();
+  res.json({ success: true, key: keyObj });
 });
 
-// ⏫ Gia hạn key
-app.post('/api/extend-key', (req, res) => {
-  const { key, days } = req.body;
-  db.get(`SELECT * FROM license_keys WHERE key_code = ?`, [key], (err, row) => {
-    if (!row) return res.status(404).send("Key không tồn tại");
-    const newDate = new Date(row.expires_at);
-    newDate.setDate(newDate.getDate() + days);
-    db.run(`UPDATE license_keys SET expires_at = ? WHERE key_code = ?`, [newDate.toISOString(), key]);
-    res.json({ message: "Gia hạn thành công", new_expires: newDate.toISOString() });
-  });
-});
-
-// ❌ Xoá key
+// ======= API: Xóa key =======
 app.post('/api/delete-key', (req, res) => {
   const { key } = req.body;
-  db.run(`DELETE FROM license_keys WHERE key_code = ?`, [key]);
-  res.json({ message: "Đã xoá key" });
+  keys = keys.filter(k => k.key_code !== key);
+  saveKeys();
+  res.json({ success: true });
 });
 
-// 🚪 Admin login
-app.post('/api/admin-login', (req, res) => {
-  const { username, password } = req.body;
-  if (username === "admin" && password === "123456")
-    return res.json({ success: true });
-  res.status(401).json({ success: false });
+// ======= API: Reset key =======
+app.post('/api/reset-key', (req, res) => {
+  const { key } = req.body;
+  const found = keys.find(k => k.key_code === key);
+  if (!found) return res.json({ success: false, message: "Không tìm thấy key" });
+  found.devices = [];
+  saveKeys();
+  res.json({ success: true });
 });
 
-// Server khởi chạy
-app.listen(PORT, "0.0.0.0", () =>
-  console.log(`✅ Server chạy tại http://localhost:${PORT}`)
-);
+// ======= API: Gia hạn thêm key =======
+app.post('/api/extend-key', (req, res) => {
+  const { key, days } = req.body;
+  const found = keys.find(k => k.key_code === key);
+  if (!found) return res.json({ success: false, message: "Không tìm thấy key" });
+  found.expires_at = new Date(new Date(found.expires_at).getTime() + days * 24 * 60 * 60 * 1000);
+  saveKeys();
+  res.json({ success: true });
+});
+
+// ======= API: Kiểm tra key cho WinForm =======
+app.post('/api/verify-key', (req, res) => {
+  const { key, device_id } = req.body;
+  const found = keys.find(k => k.key_code === key);
+
+  if (!found) return res.json({ success: false, message: "Key không tồn tại" });
+  if (new Date(found.expires_at) < new Date())
+    return res.json({ success: false, message: "Key đã hết hạn" });
+
+  if (!found.devices) found.devices = [];
+
+  if (!found.devices.includes(device_id)) {
+    if (found.devices.length >= found.allowed_devices) {
+      return res.json({ success: false, message: "Key đã vượt số thiết bị cho phép" });
+    }
+    found.devices.push(device_id);
+  }
+
+  saveKeys();
+  return res.json({ success: true });
+});
+
+// ======= Khởi động server =======
+app.listen(PORT, () => console.log(`✅ Server đang chạy tại cổng ${PORT}`));
