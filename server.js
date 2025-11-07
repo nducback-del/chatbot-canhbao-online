@@ -15,7 +15,7 @@ const __dirname = path.resolve();
 const DATA_FILE = path.join(__dirname, "keys.json");
 
 // 🔐 Admin account
-const ADMIN = { username: "admin", password: "123456" };
+const ADMIN = { username: "zxs", password: "12" };
 
 // 🗝 Load keys
 function loadKeys() {
