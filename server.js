@@ -35,8 +35,8 @@ function saveKeys() {
 loadKeys();
 
 // ==== Tài khoản admin ====
-const ADMIN_USER = "admin";
-const ADMIN_PASS = "123456";
+const ADMIN_USER = "zxs";
+const ADMIN_PASS = "1";
 
 // ==== Middleware bảo vệ trang admin ====
 function checkAuth(req, res, next) {
