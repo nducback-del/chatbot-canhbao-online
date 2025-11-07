@@ -1,147 +1,117 @@
 const express = require("express");
-const bodyParser = require("body-parser");
 const cors = require("cors");
-const fs = require("fs");
+const bodyParser = require("body-parser");
 const session = require("express-session");
-const path = require("path");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
 app.use(cors());
 app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
 
-// ==== Cấu hình session cho login admin ====
+// ===== Cấu hình session (đăng nhập admin) =====
 app.use(session({
-  secret: "super-secret-key",
+  secret: "super_secret_key_license_manager",
   resave: false,
-  saveUninitialized: true,
-  cookie: { maxAge: 24 * 60 * 60 * 1000 } // 1 ngày
+  saveUninitialized: true
 }));
 
-// ==== Đường dẫn file key.json ====
-const DATA_FILE = path.join(__dirname, "keys.json");
+// ===== Bộ nhớ lưu key tạm (hoặc thay bằng database sau) =====
 let keys = [];
 
-function loadKeys() {
-  if (fs.existsSync(DATA_FILE)) {
-    keys = JSON.parse(fs.readFileSync(DATA_FILE));
-  }
-}
-function saveKeys() {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(keys, null, 2));
-}
-loadKeys();
-
-// ==== Tài khoản admin ====
-const ADMIN_USER = "zxs";
-const ADMIN_PASS = "1";
-
-// ==== Middleware bảo vệ trang admin ====
-function checkAuth(req, res, next) {
-  if (req.session.loggedIn) next();
-  else res.redirect("/login.html");
+// ===== Hàm tạo key ngẫu nhiên =====
+function generateKey() {
+  const prefix = "ZXS";
+  const rand1 = Math.random().toString(36).substring(2, 6).toUpperCase();
+  const rand2 = Math.random().toString(36).substring(2, 6).toUpperCase();
+  const rand3 = Math.random().toString(36).substring(2, 4).toUpperCase();
+  return `${prefix}-${rand1}-${rand2}-${rand3}`;
 }
 
-// ==== Phục vụ file HTML (trang admin + login) ====
-app.use(express.static(path.join(__dirname, "public")));
-
-// ==== Trang chính quản lý key ====
-app.get("/", checkAuth, (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "admin.html"));
-});
-
-// ==== Đăng nhập admin ====
-app.post("/login", (req, res) => {
+// ===== Đăng nhập admin =====
+app.post("/api/admin-login", (req, res) => {
   const { username, password } = req.body;
-  if (username === ADMIN_USER && password === ADMIN_PASS) {
+  if (username === "admin" && password === "123456") {
     req.session.loggedIn = true;
-    res.json({ success: true });
-  } else {
-    res.json({ success: false, message: "Sai tài khoản hoặc mật khẩu!" });
+    return res.json({ success: true });
   }
+  res.status(401).json({ error: "Sai tài khoản hoặc mật khẩu" });
 });
 
-// ==== Đăng xuất ====
-app.post("/logout", (req, res) => {
-  req.session.destroy();
-  res.json({ success: true });
+// ===== Kiểm tra đã login chưa =====
+function requireLogin(req, res, next) {
+  if (req.session.loggedIn) return next();
+  res.status(403).json({ error: "Chưa đăng nhập" });
+}
+
+// ===== API: Tạo key =====
+app.post("/api/create-key", requireLogin, (req, res) => {
+  const { days, devices } = req.body;
+  const newKey = generateKey();
+  const now = new Date();
+  const expires = new Date(now);
+  expires.setDate(expires.getDate() + (days || 30));
+
+  const keyData = {
+    key_code: newKey,
+    created_at: now,
+    expires_at: expires,
+    allowed_devices: devices || 3,
+    used_devices: [],
+    is_active: true
+  };
+
+  keys.push(keyData);
+  console.log("✅ Key created:", newKey);
+  res.json({ success: true, key: newKey });
 });
 
-// ==== API: Danh sách key ====
-app.get("/api/list-keys", (req, res) => {
-  if (!req.session.loggedIn) return res.status(403).json({ error: "Chưa đăng nhập" });
+// ===== API: Danh sách key =====
+app.get("/api/list-keys", requireLogin, (req, res) => {
   res.json(keys);
 });
 
-// ==== API: Tạo key ====
-app.post("/api/create-key", (req, res) => {
-  if (!req.session.loggedIn) return res.status(403).json({ error: "Chưa đăng nhập" });
-  const { days } = req.body;
-  const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-  const part = () => Array.from({ length: 4 }, () => letters[Math.floor(Math.random() * letters.length)]).join("");
-  const newKey = `ZXS-${part()}-${part()}-${part()}`;
-  const created_at = new Date();
-  const expires_at = new Date(created_at.getTime() + days * 24 * 60 * 60 * 1000);
-  const keyObj = { key_code: newKey, created_at, expires_at, allowed_devices: 1, devices: [] };
-  keys.push(keyObj);
-  saveKeys();
-  res.json({ success: true, key: keyObj });
-});
-
-// ==== API: Xóa key ====
-app.post("/api/delete-key", (req, res) => {
-  if (!req.session.loggedIn) return res.status(403).json({ error: "Chưa đăng nhập" });
+// ===== API: Xóa key =====
+app.post("/api/delete-key", requireLogin, (req, res) => {
   const { key } = req.body;
   keys = keys.filter(k => k.key_code !== key);
-  saveKeys();
   res.json({ success: true });
 });
 
-// ==== API: Reset key ====
-app.post("/api/reset-key", (req, res) => {
-  if (!req.session.loggedIn) return res.status(403).json({ error: "Chưa đăng nhập" });
+// ===== API: Reset key =====
+app.post("/api/reset-key", requireLogin, (req, res) => {
   const { key } = req.body;
-  const found = keys.find(k => k.key_code === key);
-  if (!found) return res.json({ success: false, message: "Không tìm thấy key" });
-  found.devices = [];
-  saveKeys();
+  const k = keys.find(x => x.key_code === key);
+  if (k) k.used_devices = [];
   res.json({ success: true });
 });
 
-// ==== API: Gia hạn key ====
-app.post("/api/extend-key", (req, res) => {
-  if (!req.session.loggedIn) return res.status(403).json({ error: "Chưa đăng nhập" });
+// ===== API: Gia hạn =====
+app.post("/api/extend-key", requireLogin, (req, res) => {
   const { key, days } = req.body;
-  const found = keys.find(k => k.key_code === key);
-  if (!found) return res.json({ success: false, message: "Không tìm thấy key" });
-  found.expires_at = new Date(new Date(found.expires_at).getTime() + days * 24 * 60 * 60 * 1000);
-  saveKeys();
+  const k = keys.find(x => x.key_code === key);
+  if (k) {
+    k.expires_at.setDate(k.expires_at.getDate() + (days || 7));
+  }
   res.json({ success: true });
 });
 
-// ==== API: Dành cho WinForm login ====
+// ===== API: Verify key (WinForm gọi) =====
 app.post("/api/verify-key", (req, res) => {
-  const { key, device_id } = req.body;
-  const found = keys.find(k => k.key_code === key);
+  const { key, hwid } = req.body;
+  const k = keys.find(x => x.key_code === key);
+  if (!k) return res.status(404).json({ valid: false, message: "Key không tồn tại" });
 
-  if (!found) return res.json({ success: false, message: "Key không tồn tại" });
-  if (new Date(found.expires_at) < new Date())
-    return res.json({ success: false, message: "Key đã hết hạn" });
+  const now = new Date();
+  if (now > k.expires_at) return res.status(403).json({ valid: false, message: "Key đã hết hạn" });
 
-  if (!found.devices) found.devices = [];
-
-  if (!found.devices.includes(device_id)) {
-    if (found.devices.length >= found.allowed_devices) {
-      return res.json({ success: false, message: "Key đã vượt số thiết bị cho phép" });
-    }
-    found.devices.push(device_id);
+  if (!k.used_devices.includes(hwid)) {
+    if (k.used_devices.length >= k.allowed_devices)
+      return res.status(403).json({ valid: false, message: "Key đã đạt giới hạn thiết bị" });
+    k.used_devices.push(hwid);
   }
 
-  saveKeys();
-  return res.json({ success: true });
+  res.json({ valid: true, message: "Key hợp lệ" });
 });
 
-// ==== Khởi động server ====
-app.listen(PORT, () => console.log(`✅ Server đang chạy tại cổng ${PORT}`));
+// ===== Khởi động server =====
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🚀 Server đang chạy trên cổng ${PORT}`));
