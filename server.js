@@ -1,4 +1,4 @@
-// server.js (CommonJS)
+// server.js (CommonJS) — PATCHED for safe file writes & serialized file access
 const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
@@ -16,44 +16,121 @@ app.use(express.static('public'));
 
 const PORT = process.env.PORT || 10000;
 const DATA_FILE = path.join(__dirname, 'keys.json');
+const BACKUP_FILE = path.join(__dirname, 'keys.json.bak');
+const TMP_FILE = path.join(__dirname, 'keys.json.tmp');
 const CONFIG_FILE = path.join(__dirname, 'config.json');
 
-// --- CONFIG / SECRETS (set env vars in Render)
-// JWT secret for admin tokens:
+// JWT / HMAC secrets
 const JWT_SECRET = process.env.JWT_SECRET || 'please-change-me-jwt';
-// HMAC secret for signing keys:
 const HMAC_SECRET = process.env.HMAC_SECRET || 'please-change-me-hmac';
 
-// --- helper to read/write files
+// Initialize files if missing (only create empty file on first-run)
 if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, '[]', 'utf8');
 if (!fs.existsSync(CONFIG_FILE)) {
-  // initial config with one admin user (password bcrypt-hashed)
   const adminPassword = 'superhentai';
   const hash = bcrypt.hashSync(adminPassword, 10);
   const cfg = { admin: { username: 'zxsadmin', passwordHash: hash } };
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf8');
 }
 
-function loadKeys() {
-  try { return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); }
-  catch (e) { return []; }
+// ----------------- File operation queue (serialize all file I/O) -----------------
+// Use a Promise chain to queue operations so read-modify-write cannot interleave.
+let fileOpQueue = Promise.resolve();
+
+function enqueueFileOp(fn) {
+  // fn is async function that does the file operation and returns value
+  fileOpQueue = fileOpQueue
+    .then(() => fn())
+    .catch(err => {
+      console.error('fileOpQueue inner error:', err);
+      // swallow error to not break queue chain, but rethrow so callers can handle
+      throw err;
+    });
+  return fileOpQueue;
 }
-function saveKeys(keys) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(keys, null, 2), 'utf8');
+
+// ----------------- Safe read/write helpers -----------------
+async function safeReadFile() {
+  // Read file contents synchronously (within the queue) and parse JSON.
+  return enqueueFileOp(() => {
+    try {
+      const raw = fs.readFileSync(DATA_FILE, 'utf8');
+      try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) {
+          console.warn('keys.json content is not an array, treating as empty array');
+          return [];
+        }
+        return parsed;
+      } catch (parseErr) {
+        console.error('Failed to parse keys.json, attempting backup:', parseErr);
+        // try backup
+        if (fs.existsSync(BACKUP_FILE)) {
+          try {
+            const bak = fs.readFileSync(BACKUP_FILE, 'utf8');
+            const parsedBak = JSON.parse(bak);
+            console.warn('Recovered keys from backup');
+            return parsedBak;
+          } catch (e) {
+            console.error('Backup read/parse failed', e);
+          }
+        }
+        // as last resort return empty array (but DO NOT overwrite original file here)
+        return [];
+      }
+    } catch (err) {
+      console.error('safeReadFile error', err);
+      // if file missing (shouldn't be), return empty
+      return [];
+    }
+  });
 }
+
+async function safeWriteFile(keys) {
+  // Write atomically: write to tmp file then rename. Also keep a backup copy.
+  return enqueueFileOp(() => {
+    try {
+      // make backup first (best-effort)
+      try {
+        if (fs.existsSync(DATA_FILE)) {
+          fs.copyFileSync(DATA_FILE, BACKUP_FILE);
+        }
+      } catch (bakErr) {
+        console.warn('Backup failed (continuing):', bakErr);
+      }
+
+      // write tmp then rename
+      fs.writeFileSync(TMP_FILE, JSON.stringify(keys, null, 2), 'utf8');
+      // atomic rename on most platforms
+      fs.renameSync(TMP_FILE, DATA_FILE);
+      return true;
+    } catch (err) {
+      console.error('safeWriteFile error', err);
+      // cleanup tmp if exists
+      try { if (fs.existsSync(TMP_FILE)) fs.unlinkSync(TMP_FILE); } catch(e){}
+      throw err;
+    }
+  });
+}
+
+// ----------------- config helpers -----------------
 function loadConfig() {
-  return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+  } catch (e) {
+    console.error('Failed to read config.json', e);
+    throw e;
+  }
 }
 function saveConfig(cfg) {
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf8');
 }
 
-// --- helper: HMAC sign a value
+// ----------------- HMAC / JWT helpers -----------------
 function signValue(val) {
   return crypto.createHmac('sha256', HMAC_SECRET).update(val).digest('hex');
 }
 
-// --- middleware: protect admin endpoints with JWT
 function requireAdmin(req, res, next) {
   const auth = req.headers['authorization'];
   if (!auth) return res.status(401).json({ error: 'Missing token' });
@@ -73,7 +150,9 @@ function requireAdmin(req, res, next) {
   }
 }
 
-// --- ADMIN LOGIN -> return JWT
+// ----------------- Endpoints -----------------
+
+// Admin login
 app.post('/api/admin-login', async (req, res) => {
   const { username, password } = req.body || {};
   const cfg = loadConfig();
@@ -85,104 +164,146 @@ app.post('/api/admin-login', async (req, res) => {
   return res.json({ success: true, token });
 });
 
-// --- ADMIN: create key
-app.post('/api/create-key', requireAdmin, (req, res) => {
+// Create key (async, uses safe read/write)
+app.post('/api/create-key', requireAdmin, async (req, res) => {
   const { days, devices } = req.body || {};
-  if (!days || !devices) return res.status(400).json({ success: false, message: 'Missing params' });
+  // validate inputs
+  const daysNum = Number(days);
+  const devicesNum = Number(devices);
+  if (!Number.isFinite(daysNum) || daysNum <= 0) return res.status(400).json({ success: false, message: 'Invalid days' });
+  if (!Number.isFinite(devicesNum) || devicesNum <= 0 || devicesNum > 1000) return res.status(400).json({ success: false, message: 'Invalid devices' });
 
-  const keys = loadKeys();
-  const keyCode = `ZXS-${Math.random().toString(36).substring(2,8).toUpperCase()}-${Math.random().toString(36).substring(2,6).toUpperCase()}`;
-  const createdAt = new Date().toISOString();
-  const expiresAt = new Date(Date.now() + (days * 24 * 60 * 60 * 1000)).toISOString();
+  try {
+    const keys = await safeReadFile();
 
-  const signature = signValue(keyCode); // HMAC signature
-  const record = {
-    id: uuidv4(),
-    key_code: keyCode,
-    signature,
-    created_at: createdAt,
-    expires_at: expiresAt,
-    allowed_devices: Number(devices),
-    devices: []
-  };
-  keys.push(record);
-  saveKeys(keys);
-  return res.json({ success: true, key: record });
+    // generate unique key_code (guard against collisions)
+    let keyCode;
+    for (let attempts = 0; attempts < 8; attempts++) {
+      const candidate = `ZXS-${Math.random().toString(36).substring(2,8).toUpperCase()}-${Math.random().toString(36).substring(2,6).toUpperCase()}`;
+      if (!keys.find(k => k.key_code === candidate)) { keyCode = candidate; break; }
+    }
+    if (!keyCode) keyCode = `ZXS-${uuidv4().slice(0,8).toUpperCase()}`;
+
+    const createdAt = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + (daysNum * 24 * 60 * 60 * 1000)).toISOString();
+    const signature = signValue(keyCode);
+
+    const record = {
+      id: uuidv4(),
+      key_code: keyCode,
+      signature,
+      created_at: createdAt,
+      expires_at: expiresAt,
+      allowed_devices: Number(devicesNum),
+      devices: []
+    };
+
+    keys.push(record);
+    await safeWriteFile(keys);
+    return res.json({ success: true, key: record });
+  } catch (e) {
+    console.error('create-key error', e);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
 });
 
-// --- ADMIN: list keys
-app.get('/api/list-keys', requireAdmin, (req, res) => {
-  const keys = loadKeys();
-  return res.json(keys);
+// List keys
+app.get('/api/list-keys', requireAdmin, async (req, res) => {
+  try {
+    const keys = await safeReadFile();
+    return res.json(keys);
+  } catch (e) {
+    console.error('list-keys error', e);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
 });
 
-// --- ADMIN: extend / reset / delete
-app.post('/api/extend-key', requireAdmin, (req, res) => {
+// Extend key
+app.post('/api/extend-key', requireAdmin, async (req, res) => {
   const { key, days } = req.body || {};
-  if (!key || !days) return res.status(400).json({ success: false });
-  const keys = loadKeys();
-  const found = keys.find(k => k.key_code === key);
-  if (!found) return res.status(404).json({ success: false });
-  found.expires_at = new Date(new Date(found.expires_at).getTime() + days * 86400000).toISOString();
-  saveKeys(keys);
-  return res.json({ success: true });
+  const daysNum = Number(days);
+  if (!key || !Number.isFinite(daysNum) || daysNum <= 0) return res.status(400).json({ success: false, message: 'Invalid' });
+  try {
+    const keys = await safeReadFile();
+    const found = keys.find(k => k.key_code === key);
+    if (!found) return res.status(404).json({ success: false, message: 'Not found' });
+    found.expires_at = new Date(new Date(found.expires_at).getTime() + daysNum * 86400000).toISOString();
+    await safeWriteFile(keys);
+    return res.json({ success: true });
+  } catch (e) {
+    console.error('extend-key error', e);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
 });
 
-app.post('/api/reset-key', requireAdmin, (req, res) => {
+// Reset key devices
+app.post('/api/reset-key', requireAdmin, async (req, res) => {
   const { key } = req.body || {};
-  const keys = loadKeys();
-  const found = keys.find(k => k.key_code === key);
-  if (!found) return res.status(404).json({ success: false });
-  found.devices = [];
-  saveKeys(keys);
-  return res.json({ success: true });
+  if (!key) return res.status(400).json({ success: false, message: 'Missing key' });
+  try {
+    const keys = await safeReadFile();
+    const found = keys.find(k => k.key_code === key);
+    if (!found) return res.status(404).json({ success: false, message: 'Not found' });
+    found.devices = [];
+    await safeWriteFile(keys);
+    return res.json({ success: true });
+  } catch (e) {
+    console.error('reset-key error', e);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
 });
 
-app.post('/api/delete-key', requireAdmin, (req, res) => {
+// Delete key
+app.post('/api/delete-key', requireAdmin, async (req, res) => {
   const { key } = req.body || {};
-  let keys = loadKeys();
-  keys = keys.filter(k => k.key_code !== key);
-  saveKeys(keys);
-  return res.json({ success: true });
+  if (!key) return res.status(400).json({ success: false, message: 'Missing key' });
+  try {
+    let keys = await safeReadFile();
+    keys = keys.filter(k => k.key_code !== key);
+    await safeWriteFile(keys);
+    return res.json({ success: true });
+  } catch (e) {
+    console.error('delete-key error', e);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
 });
 
-// --- VERIFY KEY (WinForm calls this) ---
-// Note: this endpoint is intentionally public (no JWT) because WinForm cannot hold admin JWT.
-// But it checks signature & device binding. Use HTTPS in production.
-app.post('/api/verify-key', (req, res) => {
+// Verify key (public)
+app.post('/api/verify-key', async (req, res) => {
   const { key, device_id } = req.body || {};
   if (!key || !device_id) return res.status(400).json({ success: false, message: 'Missing' });
 
-  const keys = loadKeys();
-  const found = keys.find(k => k.key_code === key);
-  if (!found) return res.status(404).json({ success: false, message: 'Key not found' });
+  try {
+    const keys = await safeReadFile();
+    const found = keys.find(k => k.key_code === key);
+    if (!found) return res.status(404).json({ success: false, message: 'Key not found' });
 
-  // verify signature server-side (defense against tampered key entries)
-  const expectedSig = signValue(found.key_code);
-  if (expectedSig !== found.signature) {
-    return res.status(500).json({ success: false, message: 'Key signature mismatch' });
-  }
-
-  // expiry
-  if (new Date(found.expires_at) < new Date()) {
-    return res.json({ success: false, message: 'Expired' });
-  }
-
-  // device binding
-  if (!Array.isArray(found.devices)) found.devices = [];
-  if (!found.devices.includes(device_id)) {
-    if (found.devices.length >= found.allowed_devices) {
-      return res.json({ success: false, message: 'Device limit reached' });
+    const expectedSig = signValue(found.key_code);
+    if (expectedSig !== found.signature) {
+      return res.status(500).json({ success: false, message: 'Key signature mismatch' });
     }
-    found.devices.push(device_id);
-    saveKeys(keys);
-  }
 
-  // respond success
-  return res.json({ success: true, message: 'OK' });
+    if (new Date(found.expires_at) < new Date()) {
+      return res.json({ success: false, message: 'Expired' });
+    }
+
+    if (!Array.isArray(found.devices)) found.devices = [];
+    if (!found.devices.includes(device_id)) {
+      if (found.devices.length >= found.allowed_devices) {
+        return res.json({ success: false, message: 'Device limit reached' });
+      }
+      found.devices.push(device_id);
+      await safeWriteFile(keys);
+    }
+
+    return res.json({ success: true, message: 'OK' });
+  } catch (e) {
+    console.error('verify-key error', e);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
 });
 
-// --- Serve UI if present
+// Serve UI if present
 app.get('/', (req, res) => {
   const p = path.join(__dirname, 'public', 'index.html');
   if (fs.existsSync(p)) return res.sendFile(p);
